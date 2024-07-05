@@ -28,6 +28,24 @@ struct SharesProof {
     AttestationProof attestationProof;
 }
 
+/// @notice Contains the necessary parameters to prove that some shares, which were posted to
+/// the Celestia network, were committed to by the Blobstream smart contract, without including
+/// the data for those shares, but rather only their digests
+struct ShareDigestsProof {
+    // The digests for the shares that were committed to.
+    bytes32[] digests;
+    // The shares proof to the row roots. If the shares span multiple rows, we will have multiple nmt proofs.
+    NamespaceMerkleMultiproof[] shareProofs;
+    // The namespace of the shares.
+    Namespace namespace;
+    // The rows where the shares belong. If the shares span multiple rows, we will have multiple rows.
+    NamespaceNode[] rowRoots;
+    // The proofs of the rowRoots to the data root.
+    BinaryMerkleProof[] rowProofs;
+    // The proof of the data root tuple to the data root tuple root that was posted to the Blobstream contract.
+    AttestationProof attestationProof;
+}
+
 /// @notice Contains the necessary parameters needed to verify that a data root tuple
 /// was committed to, by the Blobstream smart contract, at some specif nonce.
 struct AttestationProof {
@@ -106,6 +124,38 @@ library DAVerifier {
         return (valid, error);
     }
 
+    /// @notice Verifies that the shares, which were posted to Celestia, were committed to by the Blobstream smart contract,
+    /// without including the data for those shares, but rather only their digests
+    /// @param _bridge The Blobstream smart contract instance.
+    /// @param _shareDigestsProof The proof of the shares to the data root tuple root, including only share digests rather than their data
+    /// @param _root The data root of the block that contains the shares.
+    /// @return `true` if the proof is valid, `false` otherwise.
+    /// @return an error code if the proof is invalid, ErrorCodes.NoError otherwise.
+    function verifyShareDigestsToDataRootTupleRoot(IDAOracle _bridge, ShareDigestsProof memory _shareDigestsProof, bytes32 _root)
+        internal
+        view
+        returns (bool, ErrorCodes)
+    {
+        // checking that the data root was committed to by the Blobstream smart contract.
+        (bool success, ErrorCodes errorCode) = verifyMultiRowRootsToDataRootTupleRoot(
+            _bridge, _shareDigestsProof.rowRoots, _shareDigestsProof.rowProofs, _shareDigestsProof.attestationProof, _root
+        );
+        if (!success) {
+            return (false, errorCode);
+        }
+
+        (bool valid, ErrorCodes error) = verifyShareDigestsToDataRootTupleRootProof(
+            _shareDigestsProof.digests,
+            _shareDigestsProof.shareProofs,
+            _shareDigestsProof.namespace,
+            _shareDigestsProof.rowRoots,
+            _shareDigestsProof.rowProofs,
+            _root
+        );
+
+        return (valid, error);
+    }
+
     /// @notice Verifies the shares to data root tuple root proof.
     /// @param _data The data that needs to proven.
     /// @param _shareProofs The share to the row roots proof.
@@ -151,6 +201,64 @@ library DAVerifier {
                 return (false, err);
             }
             if (!NamespaceMerkleTree.verifyMulti(_rowRoots[i], _shareProofs[i], _namespace, s)) {
+                return (false, ErrorCodes.InvalidSharesToRowsProof);
+            }
+            cursor += sharesUsed;
+        }
+
+        return (true, ErrorCodes.NoError);
+    }
+
+    /// @notice Verifies the share digests to data root tuple root proof.
+    /// @param _digests The data digests that need to proven.
+    /// @param _shareProofs The share to the row roots proof.
+    /// @param _namespace The namespace of the shares.
+    /// @param _rowRoots The row roots where the shares belong.
+    /// @param _rowProofs The proofs of the rowRoots to the data root.
+    /// @param _root The data root of the block that contains the shares.
+    /// @return `true` if the proof is valid, `false` otherwise.
+    /// @return an error code if the proof is invalid, ErrorCodes.NoError otherwise.
+    function verifyShareDigestsToDataRootTupleRootProof(
+        bytes32[] memory _digests,
+        NamespaceMerkleMultiproof[] memory _shareProofs,
+        Namespace memory _namespace,
+        NamespaceNode[] memory _rowRoots,
+        BinaryMerkleProof[] memory _rowProofs,
+        bytes32 _root
+    ) internal pure returns (bool, ErrorCodes) {
+        // verifying the row root to data root tuple root proof.
+        (bool success, ErrorCodes errorCode) = verifyMultiRowRootsToDataRootTupleRootProof(_rowRoots, _rowProofs, _root);
+        if (!success) {
+            return (false, errorCode);
+        }
+
+        // checking that the shares were committed to by the rows roots.
+        if (_shareProofs.length != _rowRoots.length) {
+            return (false, ErrorCodes.UnequalShareProofsAndRowRootsNumber);
+        }
+
+        uint256 numberOfSharesInProofs = 0;
+        for (uint256 i = 0; i < _shareProofs.length; i++) {
+            numberOfSharesInProofs += _shareProofs[i].endKey - _shareProofs[i].beginKey;
+        }
+
+        if (_digests.length != numberOfSharesInProofs) {
+            return (false, ErrorCodes.UnequalDataLengthAndNumberOfSharesProofs);
+        }
+
+        uint256 cursor = 0;
+        for (uint256 i = 0; i < _shareProofs.length; i++) {
+            uint256 sharesUsed = _shareProofs[i].endKey - _shareProofs[i].beginKey;
+            (bytes32[] memory s, ErrorCodes err) = sliceDigests(_digests, cursor, cursor + sharesUsed);
+            if (err != ErrorCodes.NoError) {
+                return (false, err);
+            }
+            NamespaceNode[] memory nodes = new NamespaceNode[](s.length);
+            for (uint256 iSlice = 0; iSlice < s.length; ++iSlice) {
+                nodes[iSlice] = NamespaceNode(_namespace, _namespace, s[iSlice]);
+            }
+            // Verify inclusion of leaf nodes.
+            if (!NamespaceMerkleTree.verifyMultiHashes(_rowRoots[i], _shareProofs[i], nodes)) {
                 return (false, ErrorCodes.InvalidSharesToRowsProof);
             }
             cursor += sharesUsed;
@@ -320,6 +428,31 @@ library DAVerifier {
         bytes[] memory out = new bytes[](_end - _begin);
         for (uint256 i = _begin; i < _end; i++) {
             out[i - _begin] = _data[i];
+        }
+        return (out, ErrorCodes.NoError);
+    }
+
+    /// @notice creates a slice of bytes32 from the digests slice of bytes32 containing the elements
+    /// that correspond to the provided range.
+    /// It selects a half-open range which includes the begin element, but excludes the end one.
+    /// @param _digests The slice that we want to select digests from.
+    /// @param _begin The beginning of the range (inclusive).
+    /// @param _end The ending of the range (exclusive).
+    /// @return _ the sliced digests.
+    function sliceDigests(bytes32[] memory _digests, uint256 _begin, uint256 _end)
+        internal
+        pure
+        returns (bytes32[] memory, ErrorCodes)
+    {
+        if (_begin > _end) {
+            return (_digests, ErrorCodes.InvalidRange);
+        }
+        if (_begin > _digests.length || _end > _digests.length) {
+            return (_digests, ErrorCodes.OutOfBoundsRange);
+        }
+        bytes32[] memory out = new bytes32[](_end - _begin);
+        for (uint256 i = _begin; i < _end; i++) {
+            out[i - _begin] = _digests[i];
         }
         return (out, ErrorCodes.NoError);
     }
